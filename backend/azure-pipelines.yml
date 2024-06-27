@@ -1,0 +1,282 @@
+trigger: none
+pool:
+  vmImage: ubuntu-latest
+
+container: maven:3.8.1-openjdk-20-slim
+
+#Your build pipeline references an undefined variable named ‘aiKey’. Create or edit the build pipeline for this YAML file, define the variable on the Variables tab. See https://go.microsoft.com/fwlink/?linkid=865972
+variables:
+  kubernetesCluster: 'aksba'
+  acr_repo: 'backend-demo'
+  acr_service_name: 'dockeracr'
+  azureContainerRegistry: 'acrbademo.azurecr.io'
+  azureSubscriptionEndpoint: 'beginner.academy'
+  azureSubscriptionEndpointForACR: 'azureaks'
+  azureResourceGroup: 'K8s'
+  namespace: 'backendns'
+  azure.service.connection: 'azurermacr'
+  azureResourceGroup_AKS: 'K8s'
+  acr.name: 'acrbademo'
+  acr.pull.password: '41Ugp9tDfMQqghTWB1n4l1RzmPOErKJQ6KCAXqGk9l+ACRCBLmRV'
+  acr.pull.username: 'backend'
+  acr.repo.name: 'backenddemo'
+
+stages:
+  - stage: Backend_Build
+    displayName: 'Backend Build & Push to ACR'
+    jobs:
+      - job: Build
+        displayName: Build
+        steps:
+          - task: Docker@2
+            displayName: Login to ACR
+            inputs:
+              command: login
+              containerRegistry: $(acr_service_name)
+
+          - task: Maven@3
+            inputs:
+              mavenPomFile: 'pom.xml'
+              mavenOptions: '-Xmx3072m'
+              javaHomeOption: 'JDKVersion'
+              jdkDirectory: '/usr/local/openjdk-20'
+              publishJUnitResults: false
+              mavenAuthenticateFeed: true
+              effectivePomSkip: true
+              goals: 'package -Dmaven.test.skip=true'
+
+#          - task: Maven@3
+#            inputs:
+#              mavenPomFile: 'pom.xml'
+#              mavenOptions: '-Xmx3072m'
+#              javaHomeOption: 'JDKVersion'
+#              jdkVersionOption: '20'
+#              jdkArchitectureOption: 'x64'
+#              publishJUnitResults: false
+#              testResultsFiles: '**/surefire-reports/TEST-*.xml'
+#              goals: 'package -Dmaven.test.skip=true'
+              
+          - task: Docker@2
+            displayName: Build and Push
+            inputs:
+              command: buildAndPush
+              repository: '$(acr_repo)'
+              tags: "1.16.0"
+
+          - task: HelmInstaller@0
+            displayName: 'Install Helm 3.*.*'
+            inputs:
+              helmVersion: 3.6.2
+              checkLatestHelmVersion: false
+              kubectlVersion: 1.24.9
+              checkLatestKubectl: false
+
+          - task: HelmDeploy@0
+            displayName: 'Helm package backenddemo'
+            inputs:
+              command: package
+              chartPath: backenddemo
+              destination: '$(Build.ArtifactStagingDirectory)'
+
+          - bash: |
+              export HELM_EXPERIMENTAL_OCI=1
+
+          - task: HelmDeploy@0
+            displayName: Helm Chart Push
+            inputs:
+              command: save
+              chartNameForACR: backend:v1
+              chartPathForACR: '$(Build.ArtifactStagingDirectory)/springboot-backend-0.1.0.tgz'
+              azureSubscriptionEndpointForACR: $(azureSubscriptionEndpointForACR)
+              azureResourceGroupForACR: $(azureResourceGroup)
+              azureContainerRegistry: $(azureContainerRegistry)
+
+  - stage: Deployment
+    displayName: Helm pull
+    jobs:
+      - deployment: helm_publish_aks
+        displayName: deploy to aks
+        environment:
+          name: PROD
+        #            resourceName: helmdemo
+        #            resourceType: Kubernetes
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: HelmInstaller@0
+                  displayName: 'Install Helm 3.*.*'
+                  inputs:
+                    helmVersion: 3.6.2
+                    checkLatestHelmVersion: false
+                    kubectlVersion: 1.24.9
+                    checkLatestKubectl: false
+
+                - script: |
+                    export HELM_EXPERIMENTAL_OCI=1
+                    echo "$(acr.pull.password)" | helm registry login $(acr.name).azurecr.io --username $(acr.pull.username) --password-stdin
+                  displayName: login to acr using helm
+
+                - bash: |
+                    export HELM_EXPERIMENTAL_OCI=1
+                    helm chart pull $(acr.name).azurecr.io/$(acr.repo.name):v1
+                    export HELM_EXPERIMENTAL_OCI=1
+                    helm chart export $(acr.name).azurecr.io/$(acr.repo.name):v1 --destination $(System.DefaultWorkingDirectory)
+                    pwd
+                    ls -lrt $(System.DefaultWorkingDirectory)
+                  displayName: export the chart to folder
+
+                - task: HelmDeploy@0
+                  displayName: deploy chart to aks
+                  inputs:
+                    connectionType: 'Azure Resource Manager'
+                    azureSubscription: '$(azure.service.connection)'
+                    azureResourceGroup: '$(azureResourceGroup_AKS)'
+                    kubernetesCluster: '$(kubernetesCluster)'
+                    namespace: '$(namespace)'
+                    command: 'upgrade'
+                    chartType: 'FilePath'
+                    chartPath: '$(System.DefaultWorkingDirectory)/backenddemo'
+                    releaseName: 'helmbackend'
+                    arguments: '--create-namespace --install --debug --wait --timeout 10m'
+
+#  - stage: K8s_Dev
+#    displayName: 'K8s_Dev'
+#    jobs:
+#      - job: Deploy
+#        displayName: Deploy K8s
+#        steps:
+#          - task: Kubernetes@1
+#            displayName: kubectl apply
+#            inputs:
+#              connectionType: 'Kubernetes Service Connection'
+#              kubernetesServiceEndpoint: '$(kubernetesServiceEndpoint)'
+#              namespace: '$(namespace_dev)'
+#              command: 'apply'
+#              arguments: '-f spring-demo-deployment.yaml'
+#              secretType: 'dockerRegistry'
+#              containerRegistryType: 'Azure Container Registry'
+#
+#          # - task: Kubernetes@1
+#          #   displayName: 'kubectl set Image to $(Build.BuildId)'
+#          #   inputs:
+#          #     connectionType: 'Kubernetes Service Connection'
+#          #     kubernetesServiceEndpoint: '$(kubernetesServiceEndpoint)'
+#          #     namespace: '$(namespace_dev)'
+#          #     command: 'set'
+#          #     arguments: 'image deployments/spring-demo-deployment-uday test-server=$acr_name.azurecr.io/spring-demo:$(Build.BuildId)'
+#          #     secretType: 'dockerRegistry'
+#          #     containerRegistryType: 'Azure Container Registry'
+#
+#  - stage: K8s_Deploy_Test
+#    displayName: 'K8s_DeployTest'
+#    jobs:
+#      - job: DeployTest
+#        displayName: Deploy K8s Test
+#        steps:
+#          - task: Kubernetes@1
+#            displayName: kubectl apply
+#            inputs:
+#              connectionType: 'Kubernetes Service Connection'
+#              kubernetesServiceEndpoint: '$(kubernetesServiceEndpoint)'
+#              namespace: '$(namespace_test)'
+#              command: 'apply'
+#              arguments: '-f spring-demo-deployment.yaml'
+#              secretType: 'dockerRegistry'
+#              containerRegistryType: 'Azure Container Registry'
+#
+#          - task: Kubernetes@1
+#            displayName: 'kubectl set Image to $(Build.BuildId)'
+#            inputs:
+#              connectionType: 'Kubernetes Service Connection'
+#              kubernetesServiceEndpoint: '$(kubernetesServiceEndpoint)'
+#              namespace: '$(namespace_test)'
+#              command: 'set'
+#              arguments: 'image deployments/spring-demo-deployment-uday test-server=$acr_name.azurecr.io/spring-demo:$(Build.BuildId)'
+#              secretType: 'dockerRegistry'
+#              containerRegistryType: 'Azure Container Registry'
+##  - stage: K8sTest_Deploy
+##    displayName: 'K8sTest_Deploy'
+##    jobs:
+##      - job: Deploy
+##        displayName: Deploy K8sTest
+##        steps:
+##          - task: Kubernetes@1
+##            displayName: kubectl apply
+##            inputs:
+##              connectionType: 'Kubernetes Service Connection'
+##              kubernetesServiceEndpoint: '$(kubernetesServiceEndpoint)'
+##              namespace: '$(namespace_test)'
+##              command: 'apply'
+##              arguments: '-f spring-demo-deployment.yaml'
+##              secretType: 'dockerRegistry'
+##              containerRegistryType: 'Azure Container Registry'
+##
+##         - task: Kubernetes@1
+##           displayName: 'kubectl set Image to $(Build.BuildId)'
+##           inputs:
+##             connectionType: 'Kubernetes Service Connection'
+##             kubernetesServiceEndpoint: 'aks1'
+##             namespace: '$(namespace_test)'
+##             command: 'set'
+##             arguments: 'image deployments/spring-demo-deployment-uday test-server=$arc_name.azurecr.io/spring-demo:$(Build.BuildId)'
+##             secretType: 'dockerRegistry'
+##             containerRegistryType: 'Azure Container Registry'
+#
+#
+##  - stage: Helm_Deploy
+##    displayName: 'Helm_Deploy'
+##    jobs:
+##      - job: Deploy
+##        displayName: Deploy K8s helm
+##        steps:
+##          - task: HelmInstaller@0
+##            displayName: 'Install Helm 3.*.*'
+##            inputs:
+##              helmVersion: 3.0.2
+##              checkLatestHelmVersion: false
+##              kubectlVersion: 1.10.3
+##              checkLatestKubectl: false
+##
+##          - task: HelmDeploy@0
+##            displayName: Helm list
+##            inputs:
+##              connectionType: Kubernetes Service Connection
+##              kubernetesServiceEndpoint: '$(kubernetesServiceEndpoint)'
+##              kubernetesCluster: '$(kubernetesCluster)'
+##              command: ls
+##              arguments: --all
+##
+###          - task: HelmDeploy@0
+###            displayName: 'Delete azuredevops'
+###            continueOnError: true
+###            enabled: true
+###            inputs:
+###              connectionType: Kubernetes Service Connection
+###              kubernetesServiceEndpoint: '$(kubernetesServiceEndpoint)'
+###              kubernetesCluster: '$(kubernetesCluster)'
+###              commandAndArgs: 'delete --purge azuredevops'
+###
+###          - task: HelmDeploy@0
+###            displayName: Helm list
+###            inputs:
+###              connectionType: Kubernetes Service Connection
+###              kubernetesServiceEndpoint: '$(kubernetesServiceEndpoint)'
+###              kubernetesCluster: '$(kubernetesCluster)'
+###              command: ls
+###              arguments: --all
+##
+##          - task: HelmDeploy@0
+##            displayName: 'Helm upgrade'
+##            continueOnError: true
+##            inputs:
+##              connectionType: Kubernetes Service Connection
+##              kubernetesServiceEndpoint: '$(kubernetesServiceEndpoint)'
+##              kubernetesCluster: '$(kubernetesCluster)'
+##              namespace: '$(namespace)'
+##              command: apply
+##              chartType: FilePath
+##              chartPath: '$(System.DefaultWorkingDirectory)/charts/sampleapp'
+##              releaseName: azuredevops
+##              force: true
+##              arguments: '--set image.repository=$acr_name.azurecr.io/$(acr_repo) --set image.tag=$(Build.BuildId)'
